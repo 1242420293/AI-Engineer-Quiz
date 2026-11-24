@@ -2,7 +2,11 @@
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const state = { token: localStorage.getItem("keepstack_token"), user: null,
-  q: "", mode: "keyword", media: null, tag: null, sort: "newest", collection: null };
+  q: "", media: null, include: [], exclude: [], sort: "newest", collection: null,
+  offset: 0, total: 0, loading: false };
+const PAGE_SIZE = 20;
+let libraryRequest = 0;
+let collectionNames = new Map();
 
 // ---------- API helper ----------
 async function api(path, opts = {}) {
@@ -16,8 +20,8 @@ async function api(path, opts = {}) {
 }
 
 function toast(msg, kind = "ok") {
-  const t = $("#toast"); t.textContent = msg; t.className = "toast " + kind;
-  setTimeout(() => t.classList.add("hidden"), 2600);
+  const t = $("#toast"); clearTimeout(toast.timer); t.textContent = msg; t.className = "toast " + kind;
+  toast.timer = setTimeout(() => t.classList.add("hidden"), 5000);
 }
 const fmtBytes = (b) => { if (!b) return "0 B"; const u = ["B","KB","MB","GB","TB"]; const i = Math.floor(Math.log(b)/Math.log(1024)); return (b/Math.pow(1024,i)).toFixed(i?1:0)+" "+u[i]; };
 const esc = (s) => (s ?? "").toString().replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -32,7 +36,7 @@ $("#login-form").addEventListener("submit", async (e) => {
   } catch (err) { $("#login-error").textContent = "Sign in failed: " + err.message; $("#login-error").classList.remove("hidden"); }
 });
 $("#btn-logout").addEventListener("click", logout);
-function logout() { localStorage.removeItem("keepstack_token"); state.token = null; state.user = null;
+function logout() { localStorage.removeItem("keepstack_token"); state.token = null; state.user = null; ++libraryRequest;
   $("#app").classList.add("hidden"); $("#login").classList.remove("hidden"); }
 
 function enterApp() {
@@ -40,7 +44,7 @@ function enterApp() {
   $("#user-label").textContent = `${state.user.username} (${state.user.role})`;
   const isAdmin = state.user.role === "admin";
   $$(".admin-only").forEach(el => el.classList.toggle("hidden", !isAdmin));
-  loadLibrary();
+  loadFilterOptions(); loadLibrary();
 }
 
 // ---------- navigation ----------
@@ -58,23 +62,133 @@ $$(".nav-item").forEach(btn => btn.addEventListener("click", () => {
 
 // ---------- library / search ----------
 let searchTimer;
-$("#search").addEventListener("input", (e) => { state.q = e.target.value; clearTimeout(searchTimer); searchTimer = setTimeout(loadLibrary, 250); });
-$("#search-mode").addEventListener("change", (e) => { state.mode = e.target.value; loadLibrary(); });
-$("#sort").addEventListener("change", (e) => { state.sort = e.target.value; loadLibrary(); });
-$("#active-filter").addEventListener("click", () => { state.media = null; state.tag = null; state.collection = null; loadLibrary(); });
+$("#search").addEventListener("input", (e) => { state.q = e.target.value; filtersChanged(true); });
+$("#sort").addEventListener("change", (e) => { state.sort = e.target.value; filtersChanged(); });
+$("#filter-collection").addEventListener("change", (e) => { state.collection = e.target.value || null; filtersChanged(); });
+$("#clear-filters").addEventListener("click", () => {
+  Object.assign(state, { q: "", media: null, include: [], exclude: [], collection: null, sort: "newest" });
+  $("#search").value = ""; $("#sort").value = "newest"; $("#filter-collection").value = "";
+  filtersChanged();
+});
+for (const kind of ["include", "exclude"]) {
+  $("#" + kind + "-form").addEventListener("submit", e => {
+    e.preventDefault();
+    const input = $("#" + kind + "-tag");
+    const name = input.value.trim().toLowerCase();
+    if (name && !state[kind].includes(name)) { state[kind].push(name); filtersChanged(); }
+    input.value = "";
+  });
+}
+$("#page-prev").addEventListener("click", () => { state.offset = Math.max(0, state.offset - PAGE_SIZE); loadLibrary(); });
+$("#page-next").addEventListener("click", () => { state.offset += PAGE_SIZE; loadLibrary(); });
+$("#retry-search").addEventListener("click", loadLibrary);
+
+function filtersChanged(debounce = false) {
+  state.offset = 0;
+  ++libraryRequest; // Invalidate old responses immediately, including during debounce.
+  clearTimeout(searchTimer);
+  setLibraryLoading(true);
+  renderConditions();
+  if (debounce) searchTimer = setTimeout(loadLibrary, 250);
+  else loadLibrary();
+}
+
+function queryParams() {
+  const p = new URLSearchParams({ q: state.q, sort: state.sort });
+  if (state.media) p.set("media_type", state.media);
+  if (state.collection) p.set("collection_id", state.collection);
+  state.include.forEach(t => p.append("include_tag", t));
+  state.exclude.forEach(t => p.append("exclude_tag", t));
+  return p;
+}
+
+function setLibraryLoading(loading) {
+  state.loading = loading;
+  $("#library-status").textContent = loading ? "Loading assets…" : "";
+  $("#grid").setAttribute("aria-busy", String(loading));
+  $("#export-csv").disabled = loading;
+  $("#page-prev").disabled = loading || state.offset === 0;
+  $("#page-next").disabled = loading || state.offset + PAGE_SIZE >= state.total;
+  if (loading) {
+    $("#grid").innerHTML = ""; $("#result-title").textContent = "Loading…";
+    $("#empty").classList.add("hidden"); $("#query-error").classList.add("hidden");
+    $("#page-info").textContent = "";
+  }
+}
+
+async function loadFilterOptions() {
+  try {
+    const [collections, tags] = await Promise.all([api("/api/collections"), api("/api/tags")]);
+    collectionNames = new Map(collections.collections.map(c => [String(c.id), c.name]));
+    $("#filter-collection").innerHTML = '<option value="">All collections</option>' + collections.collections.map(c =>
+      `<option value="${c.id}">${esc(c.name)}</option>`).join("");
+    $("#filter-collection").value = state.collection || "";
+    $("#tag-options").innerHTML = tags.tags.map(t => `<option value="${esc(t.name)}"></option>`).join("");
+    renderConditions();
+  } catch (err) { toast("Could not load filter options: " + err.message, "err"); }
+}
+
+function renderConditions() {
+  const conditions = [];
+  if (state.q.trim()) conditions.push(["q", state.q, "Keyword: " + state.q]);
+  if (state.collection) conditions.push(["collection", state.collection, "Collection: " + (collectionNames.get(String(state.collection)) || state.collection)]);
+  if (state.media) conditions.push(["media", state.media, "Type: " + state.media]);
+  state.include.forEach(t => conditions.push(["include", t, "Include: " + t]));
+  state.exclude.forEach(t => conditions.push(["exclude", t, "Exclude: " + t]));
+  $("#active-filters").innerHTML = conditions.map(([kind, value, label]) =>
+    `<button class="chip" data-kind="${kind}" data-value="${esc(value)}" title="Remove condition">${esc(label)} ×</button>`).join("");
+  $$("#active-filters button").forEach(btn => btn.addEventListener("click", () => {
+    const kind = btn.dataset.kind;
+    if (kind === "include" || kind === "exclude") state[kind] = state[kind].filter(t => t !== btn.dataset.value);
+    else state[kind] = kind === "q" ? "" : null;
+    $("#search").value = state.q; $("#filter-collection").value = state.collection || "";
+    filtersChanged();
+  }));
+}
 
 async function loadLibrary() {
-  const p = new URLSearchParams({ q: state.q, sort: state.sort, mode: state.mode, limit: "120" });
-  if (state.media) p.set("media_type", state.media);
-  if (state.tag) p.set("tag", state.tag);
-  if (state.collection) p.set("collection_id", state.collection);
-  const data = await api("/api/assets?" + p.toString());
-  renderFacets(data.facets);
-  renderGrid(data.items, data.total);
-  const filt = state.media || (state.tag ? "#" + state.tag : null) || (state.collection ? "collection" : null);
-  $("#active-filter").classList.toggle("hidden", !filt);
-  if (filt) $("#active-filter").textContent = filt;
+  clearTimeout(searchTimer);
+  const request = ++libraryRequest;
+  const p = queryParams(); p.set("limit", PAGE_SIZE); p.set("offset", state.offset);
+  setLibraryLoading(true); renderConditions();
+  try {
+    const data = await api("/api/assets?" + p.toString());
+    if (request !== libraryRequest || !state.token) return;
+    // A deletion/edit may remove the last item on the final page.
+    if (state.offset > 0 && state.offset >= data.total) {
+      state.offset = Math.max(0, Math.ceil(data.total / PAGE_SIZE) - 1) * PAGE_SIZE;
+      return loadLibrary();
+    }
+    state.total = data.total;
+    renderFacets(data.facets); renderGrid(data.items, data.total);
+    setLibraryLoading(false);
+    $("#page-info").textContent = data.total ?
+      `${state.offset + 1}–${Math.min(state.offset + PAGE_SIZE, data.total)} of ${data.total} · Page ${state.offset / PAGE_SIZE + 1}` : "0 matches";
+  } catch (err) {
+    if (request !== libraryRequest) return;
+    setLibraryLoading(false);
+    $("#result-title").textContent = "Search failed";
+    $("#query-error").classList.remove("hidden");
+    $("#query-error-message").textContent = err.message;
+    $("#page-prev").disabled = true; $("#page-next").disabled = true;
+    $("#export-csv").disabled = true;
+  }
 }
+
+$("#export-csv").addEventListener("click", async () => {
+  const button = $("#export-csv");
+  button.disabled = true; button.textContent = "Exporting…";
+  try {
+    const response = await api("/api/assets/export.csv?" + queryParams().toString());
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url; link.download = "assets.csv"; document.body.append(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast("CSV downloaded");
+  } catch (err) { toast("CSV download failed: " + err.message, "err"); }
+  finally { button.disabled = state.loading; button.textContent = "Export all matches (CSV)"; }
+});
 
 function renderGrid(items, total) {
   $("#result-title").textContent = state.q ? `Results (${total})` : `Library (${total})`;
@@ -94,9 +208,9 @@ function renderFacets(facets) {
   $("#facet-media").innerHTML = (facets.media_types || []).map(m =>
     `<li class="${state.media===m.value?'active':''}" data-media="${m.value}"><span>${m.value}</span><span class="count">${m.count}</span></li>`).join("");
   $("#facet-tags").innerHTML = (facets.tags || []).slice(0, 18).map(t =>
-    `<li class="${state.tag===t.value?'active':''}" data-tag="${esc(t.value)}"><span>${esc(t.value)}</span><span class="count">${t.count}</span></li>`).join("");
-  $$("#facet-media li").forEach(li => li.addEventListener("click", () => { state.media = state.media===li.dataset.media?null:li.dataset.media; loadLibrary(); }));
-  $$("#facet-tags li").forEach(li => li.addEventListener("click", () => { state.tag = state.tag===li.dataset.tag?null:li.dataset.tag; loadLibrary(); }));
+    `<li class="${state.include.includes(t.value)?'active':''}" data-tag="${esc(t.value)}"><span>${esc(t.value)}</span><span class="count">${t.count}</span></li>`).join("");
+  $$("#facet-media li").forEach(li => li.addEventListener("click", () => { state.media = state.media===li.dataset.media?null:li.dataset.media; filtersChanged(); }));
+  $$("#facet-tags li").forEach(li => li.addEventListener("click", () => { const tag = li.dataset.tag; state.include = state.include.includes(tag) ? state.include.filter(t => t !== tag) : [...state.include, tag]; filtersChanged(); }));
 }
 
 // ---------- asset detail drawer ----------
@@ -144,8 +258,13 @@ async function openAsset(uuid) {
     <div class="detail-section"><h4>Tags</h4>
       <div class="tag-row" id="tag-row">
         ${d.tags.map(t => `<span class="tag ${t.source==='ai'?'ai':''}">${esc(t.name)}${canEdit?`<span class="rm" data-tag="${esc(t.name)}">&times;</span>`:""}</span>`).join("")}
-        ${canEdit?`<input class="tag-add" id="tag-add" placeholder="+ add tag">`:""}
-      </div></div>
+        ${canEdit?`<form id="tag-add-form" class="tag-add-form">
+          <input class="tag-add" id="tag-add" aria-label="New tag" placeholder="+ add tag" autocomplete="off">
+          <button class="btn" id="tag-add-submit" type="submit">Add tag</button>
+        </form>`:""}
+      </div>
+      ${canEdit?`<p class="muted tag-help">Enter a tag, then click Add tag or press Enter. Tags are saved separately from metadata.</p>
+      <p id="tag-error" class="error hidden" role="alert"></p>`:""}</div>
 
     ${sim.items.length?`<div class="detail-section"><h4>Similar assets</h4>
       <div class="similar-strip">${sim.items.slice(0,8).map(s=>`<img src="/api/assets/${s.uuid}/thumb" data-uuid="${s.uuid}" title="${esc(s.title)}">`).join("")}</div></div>`:""}
@@ -168,17 +287,33 @@ async function openAsset(uuid) {
       const body = {};
       ["title","description","alt_text","dc_creator","rights_statement","retention_until"].forEach(f => { const el = $("#e-"+f); if (el) body[f] = el.value; });
       await api("/api/assets/"+uuid, { method: "PATCH", json: body });
-      toast("Saved"); openAsset(uuid); loadLibrary();
+      toast("Saved"); openAsset(uuid); loadLibrary(); loadFilterOptions();
     });
-    $("#tag-add")?.addEventListener("keydown", async (e) => {
-      if (e.key === "Enter" && e.target.value.trim()) {
-        await api("/api/assets/"+uuid+"/tags", { json: { name: e.target.value.trim() } });
-        openAsset(uuid);
+    $("#tag-add-form")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const input = $("#tag-add"), button = $("#tag-add-submit"), error = $("#tag-error");
+      if (button.disabled) return;
+      const name = input.value.trim();
+      error.classList.add("hidden");
+      if (!name) {
+        error.textContent = "Enter a tag name first.";
+        error.classList.remove("hidden");
+        return;
       }
+      button.disabled = true; button.textContent = "Adding…";
+      try {
+        await api("/api/assets/"+uuid+"/tags", { json: { name } });
+        await openAsset(uuid);
+        loadLibrary(); loadFilterOptions();
+        toast("Tag added");
+      } catch (err) {
+        error.textContent = "Could not add tag: " + err.message;
+        error.classList.remove("hidden");
+      } finally { button.disabled = false; button.textContent = "Add tag"; }
     });
     $$("#tag-row .rm").forEach(rm => rm.addEventListener("click", async () => {
       await api("/api/assets/"+uuid+"/tags/"+encodeURIComponent(rm.dataset.tag), { method: "DELETE" });
-      openAsset(uuid);
+      openAsset(uuid); loadLibrary(); loadFilterOptions();
     }));
     $("#d-share")?.addEventListener("click", async () => {
       const r = await api("/api/shares", { json: { target_type: "asset", target_id: a.id, permission: "download" } });
@@ -228,16 +363,17 @@ async function loadCollections() {
     `<div class="collection-card" data-id="${c.id}"><span class="n">${esc(c.name)}</span><span class="muted">${c.asset_count} assets</span><span class="muted">${esc(c.description||"")}</span></div>`).join("")
     || '<p class="muted">No collections yet.</p>';
   $$("#collection-list .collection-card").forEach(card => card.addEventListener("click", () => {
-    state.collection = card.dataset.id; state.media = null; state.tag = null;
+    state.collection = card.dataset.id;
+    $("#filter-collection").value = state.collection;
     $$(".nav-item").forEach(b => b.classList.remove("active"));
     $('.nav-item[data-view="library"]').classList.add("active");
     $$(".view").forEach(v => v.classList.add("hidden")); $("#view-library").classList.remove("hidden");
-    loadLibrary();
+    filtersChanged();
   }));
 }
 $("#btn-new-collection").addEventListener("click", async () => {
   const name = prompt("Collection name"); if (!name) return;
-  await api("/api/collections", { json: { name } }); loadCollections();
+  await api("/api/collections", { json: { name } }); loadCollections(); loadFilterOptions();
 });
 
 // ---------- dashboard ----------

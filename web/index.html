@@ -31,10 +31,7 @@
       </div>
       <div class="search-box">
         <input id="search" placeholder="Search assets, tags, metadata...">
-        <select id="search-mode" title="Search mode">
-          <option value="keyword">Keyword</option>
-          <option value="semantic">Semantic</option>
-        </select>
+
       </div>
       <div class="topbar-right">
         <button id="btn-upload" class="btn btn-primary">Upload</button>
@@ -57,11 +54,11 @@
 
         <div id="facets" class="facets">
           <div class="facet-group">
-            <h4>Media type</h4>
+            <h4>Media type · all active assets</h4>
             <ul id="facet-media"></ul>
           </div>
           <div class="facet-group">
-            <h4>Top tags</h4>
+            <h4>Top tags · all active assets</h4>
             <ul id="facet-tags"></ul>
           </div>
         </div>
@@ -72,7 +69,7 @@
           <div class="view-head">
             <h2 id="result-title">Library</h2>
             <div class="view-controls">
-              <span id="active-filter" class="chip hidden"></span>
+              <button id="export-csv" class="btn btn-primary">Export all matches (CSV)</button>
               <select id="sort">
                 <option value="newest">Newest</option>
                 <option value="oldest">Oldest</option>
@@ -81,8 +78,23 @@
               </select>
             </div>
           </div>
-          <div id="grid" class="grid"></div>
-          <div id="empty" class="empty hidden">No assets yet. Click Upload to get started.</div>
+          <div class="filter-panel">
+            <label>Collection<select id="filter-collection"><option value="">All collections</option></select></label>
+            <form id="include-form"><label>Include ALL tags<input id="include-tag" list="tag-options" placeholder="Enter one full tag name"></label><button class="btn" type="submit">Add</button></form>
+            <form id="exclude-form"><label>Exclude ANY tags<input id="exclude-tag" list="tag-options" placeholder="Enter one full tag name"></label><button class="btn" type="submit">Add</button></form>
+            <datalist id="tag-options"></datalist>
+            <button id="clear-filters" class="btn" type="button">Clear all</button>
+          </div>
+          <div id="active-filters" class="active-filters" aria-label="Active conditions"></div>
+          <p id="library-status" class="muted" role="status"></p>
+          <div id="query-error" class="error hidden" role="alert">Search failed: <span id="query-error-message"></span> <button id="retry-search" class="btn">Retry</button></div>
+          <div id="grid" class="grid" aria-busy="false"></div>
+          <div class="pagination" aria-label="Results pages">
+            <button id="page-prev" class="btn" disabled>Previous</button>
+            <span id="page-info" role="status"></span>
+            <button id="page-next" class="btn" disabled>Next</button>
+          </div>
+          <div id="empty" class="empty hidden">No matching assets. Try changing or clearing the filters.</div>
         </div>
 
         <div id="view-collections" class="view hidden">

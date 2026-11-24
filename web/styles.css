@@ -226,3 +226,18 @@ button, input, select { font-family: inherit; font-size: inherit; }
   .layout { grid-template-columns: 1fr; }
   .sidebar { display: none; }
 }
+
+/* Search conditions and paging */
+.filter-panel { display:flex; flex-wrap:wrap; align-items:flex-end; gap:12px; padding:16px; margin-bottom:12px; background:var(--panel, #fff); border:1px solid var(--border, #dce2ef); border-radius:12px; }
+.filter-panel label { display:flex; flex-direction:column; gap:6px; font-size:13px; }
+.filter-panel form { display:flex; gap:6px; align-items:flex-end; }
+.filter-panel input, .filter-panel select { max-width:100%; padding:9px; border:1px solid #dce2ef; border-radius:6px; background:#fff; color:#17213b; }
+.active-filters { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
+.active-filters .chip { cursor:pointer; overflow-wrap:anywhere; max-width:100%; border:1px solid var(--base-3); }
+.active-filters .chip::after { content:none; }
+.pagination { display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:16px; margin:24px 0; }
+button:disabled { opacity:.5; cursor:default; }
+#query-error { overflow-wrap:anywhere; padding:12px; }
+.tag-add-form { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:0; }
+.tag-help { font-size:12px; margin:8px 0; }
+@media (max-width:700px) { .filter-panel > *, .filter-panel form { width:100%; } .filter-panel form label { flex:1; min-width:0; } .view-head { flex-wrap:wrap; gap:12px; } }

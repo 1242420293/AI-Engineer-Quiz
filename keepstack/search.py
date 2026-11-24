@@ -6,21 +6,19 @@ Three complementary modes over one catalog:
   * filter   - faceted structured filters (media type, tag, status, dates)
   * semantic - embedding cosine ranking ("natural language" / more-like-this)
 
-Facet counts are returned alongside results so the UI can render a live,
-drill-down sidebar.
+Facet counts cover all assets of the requested status, independently of the
+current search conditions. The UI labels them accordingly.
 """
 from __future__ import annotations
-
-from typing import Optional
 
 from . import ai
 from .db import get_conn
 
 SORTS = {
-    "newest": "a.created_at DESC",
-    "oldest": "a.created_at ASC",
-    "name": "a.title ASC",
-    "largest": "a.size DESC",
+    "newest": "a.created_at DESC, a.id DESC",
+    "oldest": "a.created_at ASC, a.id ASC",
+    "name": "a.title ASC, a.id ASC",
+    "largest": "a.size DESC, a.id DESC",
 }
 
 
@@ -30,62 +28,71 @@ def _fts_query(q: str) -> str:
     return " ".join(f'"{t}"*' for t in terms)
 
 
-def search(
-    *,
-    q: str = "",
-    media_type: Optional[str] = None,
-    tag: Optional[str] = None,
-    collection_id: Optional[int] = None,
-    status: str = "active",
-    sort: str = "newest",
-    mode: str = "keyword",
-    limit: int = 60,
-    offset: int = 0,
-) -> dict:
-    conn = get_conn()
-
-    # Semantic mode ranks the candidate pool by embedding similarity.
-    if mode == "semantic" and q.strip():
-        return _semantic_search(q, media_type, status, limit, offset)
-
-    where = ["a.status = ?"]
-    params: list = [status]
-    join = ""
-
+def _query(*, q="", media_type=None, tag=None, collection_id=None,
+           include_tag=None, exclude_tag=None, sort="newest", status="active"):
+    """One predicate builder for counts, pages and exports; values stay bound."""
+    if sort not in SORTS:
+        raise ValueError("Unknown sort")
+    where, params = ["a.status = ?"], [status]
     if q.strip():
-        join += " JOIN asset_fts f ON f.rowid = a.id"
-        where.append("asset_fts MATCH ?")
-        params.append(_fts_query(q))
+        expression = _fts_query(q)
+        if expression:
+            where.append("a.id IN (SELECT rowid FROM asset_fts WHERE asset_fts MATCH ?)")
+            params.append(expression)
+        else:
+            where.append("0")
     if media_type:
         where.append("a.media_type = ?")
         params.append(media_type)
-    if tag:
-        join += (" JOIN asset_tags at ON at.asset_id = a.id"
-                 " JOIN tags t ON t.id = at.tag_id AND t.name = ?")
-        params.append(tag.lower())
-    if collection_id:
-        join += " JOIN collection_assets ca ON ca.asset_id = a.id AND ca.collection_id = ?"
+    if collection_id is not None:
+        where.append("EXISTS (SELECT 1 FROM collection_assets ca "
+                     "WHERE ca.asset_id = a.id AND ca.collection_id = ?)")
         params.append(collection_id)
+    included = {t.strip().lower() for t in [*(include_tag or []), *([tag] if tag else [])] if t.strip()}
+    excluded = {t.strip().lower() for t in (exclude_tag or []) if t.strip()}
+    if included & excluded:
+        where.append("0")
+    for names, negate in ((included, ""), (excluded, "NOT ")):
+        for name in sorted(names):
+            where.append(negate + "EXISTS (SELECT 1 FROM asset_tags at JOIN tags t ON t.id = at.tag_id "
+                         "WHERE at.asset_id = a.id AND t.name = ?)")
+            params.append(name)
+    return " AND ".join(where), params, SORTS[sort]
 
-    where_sql = " AND ".join(where)
-    order = "bm25(asset_fts)" if q.strip() else SORTS.get(sort, SORTS["newest"])
 
-    total = conn.execute(
-        f"SELECT COUNT(*) AS c FROM assets a{join} WHERE {where_sql}", params
-    ).fetchone()["c"]
+def search(*, q="", media_type=None, tag=None, collection_id=None,
+           include_tag=None, exclude_tag=None, status="active", sort="newest",
+           mode="keyword", limit=60, offset=0) -> dict:
+    if not 1 <= limit <= 200 or offset < 0:
+        raise ValueError("Invalid pagination")
+    # Retained for existing internal callers; the quiz UI/API use keyword mode.
+    if mode == "semantic" and q.strip():
+        return _semantic_search(q, media_type, status, limit, offset)
+    where, params, order = _query(q=q, media_type=media_type, tag=tag,
+        collection_id=collection_id, include_tag=include_tag, exclude_tag=exclude_tag,
+        status=status, sort=sort)
+    conn = get_conn()
+    total = conn.execute(f"SELECT COUNT(*) c FROM assets a WHERE {where}", params).fetchone()["c"]
+    rows = conn.execute(f"SELECT a.* FROM assets a WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                        [*params, limit, offset]).fetchall()
+    return {"total": total, "items": [_card(dict(r)) for r in rows],
+            "facets": _facets(status), "mode": mode}
 
-    rows = conn.execute(
-        f"""SELECT a.* FROM assets a{join} WHERE {where_sql}
-            ORDER BY {order} LIMIT ? OFFSET ?""",
-        [*params, limit, offset],
-    ).fetchall()
 
-    return {
-        "total": total,
-        "items": [_card(dict(r)) for r in rows],
-        "facets": _facets(status),
-        "mode": mode,
-    }
+def export_rows(**filters) -> list[dict]:
+    """All matches in list order, with sorted tag arrays and no pagination."""
+    where, params, order = _query(**filters)
+    conn = get_conn()
+    rows = [dict(r) for r in conn.execute(
+        f"SELECT a.* FROM assets a WHERE {where} ORDER BY {order}", params)]
+    tags = {}
+    for row in conn.execute(
+        f"SELECT at.asset_id, t.name FROM asset_tags at JOIN tags t ON t.id = at.tag_id "
+        f"JOIN assets a ON a.id = at.asset_id WHERE {where} ORDER BY t.name", params):
+        tags.setdefault(row["asset_id"], []).append(row["name"])
+    for row in rows:
+        row["tags"] = tags.get(row["id"], [])
+    return rows
 
 
 def _semantic_search(q, media_type, status, limit, offset) -> dict:
